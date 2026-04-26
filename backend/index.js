@@ -1,0 +1,285 @@
+const express = require('express');
+const cors = require('cors');
+const { PrismaClient } = require('@prisma/client');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+
+const app = express();
+const prisma = new PrismaClient();
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'supersecretjwtkey';
+
+app.use(cors());
+app.use(express.json());
+
+// Initialize Gemini
+let genAI;
+if (process.env.GEMINI_API_KEY) {
+  genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+}
+
+// -----------------------------------------------------
+// 1. Auth Routes
+// -----------------------------------------------------
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password } = req.body;
+  try {
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing) return res.status(400).json({ error: 'User already exists' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = await prisma.user.create({
+      data: { name, email, password: hashedPassword }
+    });
+
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(400).json({ error: 'Invalid credentials' });
+
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { email, newPassword } = req.body;
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await prisma.user.update({
+      where: { email },
+      data: { password: hashedPassword }
+    });
+
+    res.json({ message: 'Password updated successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.sendStatus(401);
+
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) return res.sendStatus(403);
+    req.user = decoded;
+    next();
+  });
+};
+
+app.delete('/api/user/delete', authenticateToken, async (req, res) => {
+  try {
+    await prisma.user.delete({ where: { id: req.user.userId } });
+    res.json({ message: 'User deleted' });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/user/save-city', authenticateToken, async (req, res) => {
+  const { cityId } = req.body;
+  try {
+    const existing = await prisma.savedCity.findUnique({
+      where: { userId_cityId: { userId: req.user.userId, cityId } }
+    });
+    
+    if (existing) {
+      await prisma.savedCity.delete({ where: { id: existing.id } });
+      res.json({ saved: false });
+    } else {
+      await prisma.savedCity.create({
+        data: { userId: req.user.userId, cityId }
+      });
+      res.json({ saved: true });
+    }
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/user/saved-cities', authenticateToken, async (req, res) => {
+  try {
+    const saved = await prisma.savedCity.findMany({
+      where: { userId: req.user.userId },
+      include: { city: true }
+    });
+    res.json(saved.map(s => s.city));
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// -----------------------------------------------------
+// 2. Core Routes
+// -----------------------------------------------------
+app.get('/api/cities', async (req, res) => {
+  try {
+    const cities = await prisma.city.findMany({ orderBy: { name: 'asc' } });
+    res.json(cities);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+app.get('/api/city/:id', async (req, res) => {
+  try {
+    const city = await prisma.city.findUnique({
+      where: { id: req.params.id },
+      include: { places: true }
+    });
+    res.json(city);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+app.get('/api/prices/:cityId', async (req, res) => {
+  try {
+    const prices = await prisma.priceItem.findMany({
+      where: { cityId: req.params.cityId },
+      include: { category: true }
+    });
+    const grouped = prices.reduce((acc, curr) => {
+      const catName = curr.category.name;
+      if (!acc[catName]) acc[catName] = [];
+      acc[catName].push({
+        ...curr,
+        min: curr.minPrice,
+        max: curr.maxPrice,
+        avg: curr.avgPrice
+      });
+      return acc;
+    }, {});
+    res.json(grouped);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// -----------------------------------------------------
+// 3. AI Routes (Gemini)
+// -----------------------------------------------------
+app.post('/api/predict/image', upload.single('image'), async (req, res) => {
+  if (!req.file || !genAI) return res.status(400).json({ error: 'Missing requirements' });
+  const { cityId } = req.body;
+
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    
+    let cityContext = "";
+    if (cityId) {
+      const city = await prisma.city.findUnique({ where: { id: cityId } });
+      const prices = await prisma.priceItem.findMany({ where: { cityId } });
+      cityContext = `The user is in ${city.name}. Local references: ${prices.map(p => `${p.name}: ₹${p.minPrice}-₹${p.maxPrice}`).join(', ')}.`;
+    }
+
+    const prompt = `Identify this tourist item or souvenir in the context of Indian tourism. 
+    ${cityContext}
+    
+    CRITICAL INSTRUCTIONS:
+    1. Base your price estimates strictly on the local city context provided above if available.
+    2. Return ONLY a raw JSON object with NO markdown formatting (no \`\`\`json blocks).
+    3. JSON structure: 
+    {
+      "item_name": "Name of item",
+      "min_price_inr": number,
+      "max_price_inr": number,
+      "prediction_confidence": number (0-1)
+    }`;
+
+    const imagePart = {
+      inlineData: {
+        data: req.file.buffer.toString("base64"),
+        mimeType: req.file.mimetype
+      }
+    };
+
+    const result = await model.generateContent([prompt, imagePart]);
+    let text = result.response.text();
+    // Clean up any potential markdown
+    text = text.replace(/```json|```/g, "").trim();
+    
+    const parsed = JSON.parse(text);
+    
+    res.json({
+      ...parsed,
+      local_price_range: `₹${parsed.min_price_inr} - ₹${parsed.max_price_inr}`,
+      tourist_price_estimate: `₹${Math.round(parsed.max_price_inr * 1.5)}`,
+      fair_bargain_price: `₹${Math.round((parsed.min_price_inr + parsed.max_price_inr)/2 * 0.9)}`,
+      is_mock: false
+    });
+  } catch (error) {
+    console.error("Gemini failed:", error);
+    res.status(500).json({ error: 'AI Prediction failed. Please check your API key.' });
+  }
+});
+
+app.post('/api/chat', async (req, res) => {
+  const { prompt } = req.body;
+  if (!genAI) return res.status(500).json({ error: 'Gemini not configured' });
+
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const result = await model.generateContent(`
+      You are "Travel Saathi", a savvy, helpful Indian travel assistant.
+      Your goal is to help tourists find fair prices and avoid overpaying.
+      Be friendly, informative, and provide specific bargaining tips when relevant.
+      
+      User query: ${prompt}
+    `);
+    res.json({ response: result.response.text(), is_mock: false });
+  } catch (error) {
+    console.error("Gemini Chat failed:", error);
+    res.status(500).json({ error: 'Chat service unavailable.' });
+  }
+});
+
+// -----------------------------------------------------
+// 4. Calculations
+// -----------------------------------------------------
+function getDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+app.post('/api/predict/intercity', async (req, res) => {
+  const { fromCityId, toCityId, mode } = req.body;
+  try {
+    const from = await prisma.city.findUnique({ where: { id: fromCityId } });
+    const to = await prisma.city.findUnique({ where: { id: toCityId } });
+    if (!from || !to || !from.latitude || !to.latitude) return res.status(400).json({ error: 'Data missing' });
+
+    const dist = getDistance(from.latitude, from.longitude, to.latitude, to.longitude);
+    const rates = { Bus: 2.5, Train: 1.5, Cab: 15, Flight: 40 };
+    res.json({ distanceKm: Math.round(dist), estimatedFare: Math.round(dist * (rates[mode] || 8)) });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+app.listen(PORT, () => console.log(`Running on ${PORT}`));

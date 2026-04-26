@@ -1,0 +1,91 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id          String       @id @default(uuid())
+  email       String       @unique
+  password    String
+  name        String
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  savedCities SavedCity[]
+}
+
+model City {
+  id          String       @id @default(uuid())
+  name        String       @unique
+  state       String
+  description String
+  imageUrl    String
+  themeColor  String
+  latitude    Float?
+  longitude   Float?
+  prices      PriceItem[]
+  places      Place[]
+  savedBy     SavedCity[]
+  communityPrices CommunityPrice[]
+}
+
+model Place {
+  id          String   @id @default(uuid())
+  name        String
+  description String
+  imageUrl    String
+  cityId      String
+
+  city        City     @relation(fields: [cityId], references: [id], onDelete: Cascade)
+}
+
+model SavedCity {
+  id        String   @id @default(uuid())
+  userId    String
+  cityId    String
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  city      City     @relation(fields: [cityId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, cityId])
+}
+
+model Category {
+  id          String   @id @default(uuid())
+  name        String   @unique // Transport, Food, Shopping, Tourism
+  iconName    String
+  prices      PriceItem[]
+  communityPrices CommunityPrice[]
+}
+
+model PriceItem {
+  id          String   @id @default(uuid())
+  name        String
+  minPrice    Float
+  maxPrice    Float
+  avgPrice    Float
+  baseFare    Float?
+  perKmFare   Float?
+  isSouvenir  Boolean  @default(false)
+  cityId      String
+  categoryId  String
+
+  city        City     @relation(fields: [cityId], references: [id])
+  category    Category @relation(fields: [categoryId], references: [id])
+}
+
+model CommunityPrice {
+  id          String   @id @default(uuid())
+  itemName    String
+  pricePaid   Float
+  cityId      String
+  categoryId  String
+  createdAt   DateTime @default(now())
+
+  city        City     @relation(fields: [cityId], references: [id])
+  category    Category @relation(fields: [categoryId], references: [id])
+}
