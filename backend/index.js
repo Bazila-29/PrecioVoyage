@@ -4,9 +4,9 @@ const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
+const OpenAI = require('openai');
 
 const app = express();
 const prisma = new PrismaClient();
@@ -16,11 +16,11 @@ const JWT_SECRET = process.env.JWT_SECRET || 'supersecretjwtkey';
 app.use(cors());
 app.use(express.json());
 
-// Initialize Gemini
-let genAI;
-if (process.env.GEMINI_API_KEY) {
-  genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-}
+// Initialize AI (OpenRouter)
+const openai = new OpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: 'https://openrouter.ai/api/v1'
+});
 
 // -----------------------------------------------------
 // 1. Auth Routes
@@ -179,15 +179,13 @@ app.get('/api/prices/:cityId', async (req, res) => {
 });
 
 // -----------------------------------------------------
-// 3. AI Routes (Gemini)
+// 3. AI Routes (Gemini via OpenRouter)
 // -----------------------------------------------------
 app.post('/api/predict/image', upload.single('image'), async (req, res) => {
-  if (!req.file || !genAI) return res.status(400).json({ error: 'Missing requirements' });
+  if (!req.file || !process.env.OPENROUTER_API_KEY) return res.status(400).json({ error: 'Missing requirements' });
   const { cityId } = req.body;
 
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    
     let cityContext = "";
     if (cityId) {
       const city = await prisma.city.findUnique({ where: { id: cityId } });
@@ -195,32 +193,23 @@ app.post('/api/predict/image', upload.single('image'), async (req, res) => {
       cityContext = `The user is in ${city.name}. Local references: ${prices.map(p => `${p.name}: ₹${p.minPrice}-₹${p.maxPrice}`).join(', ')}.`;
     }
 
-    const prompt = `Identify this tourist item or souvenir in the context of Indian tourism. 
-    ${cityContext}
-    
-    CRITICAL INSTRUCTIONS:
-    1. Base your price estimates strictly on the local city context provided above if available.
-    2. Return ONLY a raw JSON object with NO markdown formatting (no \`\`\`json blocks).
-    3. JSON structure: 
-    {
-      "item_name": "Name of item",
-      "min_price_inr": number,
-      "max_price_inr": number,
-      "prediction_confidence": number (0-1)
-    }`;
+    const base64Image = req.file.buffer.toString("base64");
+    const response = await openai.chat.completions.create({
+      model: "google/gemini-2.5-flash",
+      max_tokens: 500,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: `Identify this tourist item or souvenir in the context of Indian tourism. ${cityContext} Return ONLY a raw JSON object: {"item_name": "...", "min_price_inr": 100, "max_price_inr": 200, "prediction_confidence": 0.9}. No markdown.` },
+            { type: "image_url", image_url: { url: `data:${req.file.mimetype};base64,${base64Image}` } }
+          ]
+        }
+      ]
+    });
 
-    const imagePart = {
-      inlineData: {
-        data: req.file.buffer.toString("base64"),
-        mimeType: req.file.mimetype
-      }
-    };
-
-    const result = await model.generateContent([prompt, imagePart]);
-    let text = result.response.text();
-    // Clean up any potential markdown
+    let text = response.choices[0].message.content;
     text = text.replace(/```json|```/g, "").trim();
-    
     const parsed = JSON.parse(text);
     
     res.json({
@@ -231,27 +220,30 @@ app.post('/api/predict/image', upload.single('image'), async (req, res) => {
       is_mock: false
     });
   } catch (error) {
-    console.error("Gemini failed:", error);
-    res.status(500).json({ error: 'AI Prediction failed. Please check your API key.' });
+    console.error("AI Image failed:", error);
+    res.status(500).json({ error: 'AI Prediction failed.' });
   }
 });
 
 app.post('/api/chat', async (req, res) => {
   const { prompt } = req.body;
-  if (!genAI) return res.status(500).json({ error: 'Gemini not configured' });
+  if (!process.env.OPENROUTER_API_KEY) return res.status(500).json({ error: 'AI not configured' });
 
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const result = await model.generateContent(`
-      You are "Travel Saathi", a savvy, helpful Indian travel assistant.
-      Your goal is to help tourists find fair prices and avoid overpaying.
-      Be friendly, informative, and provide specific bargaining tips when relevant.
-      
-      User query: ${prompt}
-    `);
-    res.json({ response: result.response.text(), is_mock: false });
+    const response = await openai.chat.completions.create({
+      model: "google/gemini-2.5-flash",
+      max_tokens: 1000,
+      messages: [
+        {
+          role: "system",
+          content: "You are 'Travel Saathi', a savvy, helpful Indian travel assistant. Help tourists find fair prices and provide bargaining tips."
+        },
+        { role: "user", content: prompt }
+      ]
+    });
+    res.json({ response: response.choices[0].message.content, is_mock: false });
   } catch (error) {
-    console.error("Gemini Chat failed:", error);
+    console.error("AI Chat failed:", error);
     res.status(500).json({ error: 'Chat service unavailable.' });
   }
 });

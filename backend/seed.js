@@ -175,9 +175,16 @@ async function main() {
       }
     }
 
+    const metros = ['Mumbai', 'Delhi', 'Bengaluru', 'Chennai', 'Hyderabad', 'Kolkata'];
+    const hillStations = ['Shimla', 'Srinagar'];
+    
+    let multiplier = 1.0;
+    if (metros.includes(cityData.name)) multiplier = 1.5; // High cost of living
+    else if (hillStations.includes(cityData.name)) multiplier = 1.3; // Tough terrain
+    else if (cityData.state === 'Rajasthan') multiplier = 1.1; // Tourist premium
+    
     for (const [catName, items] of Object.entries(itemTemplates)) {
       const category = categoryDocs[catName];
-      const multiplier = (cityData.name === 'Mumbai' || cityData.name === 'Delhi' || cityData.name === 'Bengaluru') ? 1.4 : 1.0;
 
       for (const item of items) {
         await prisma.priceItem.create({
